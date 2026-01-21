@@ -15,48 +15,37 @@ from datetime import datetime
 import argparse
 import asyncio
 from pathlib import Path
-from hashlib import md5
-from typing import cast
 from geopandas import GeoDataFrame
-import pickle
 
-class CacheError(Exception):
-    """Raised when a cache operation fails."""
-    pass
+ox.settings.use_cache = True
+ox.settings.cache_folder = "osmnx_cache"
+ox.settings.log_console = False
 
-CACHE_DIR_PATH = os.environ.get("CACHE_DIR", "cache")
-CACHE_DIR = Path(CACHE_DIR_PATH)
-
-CACHE_DIR.mkdir(exist_ok=True)
-
-def cache_file(key: str) -> str:
-    encoded = md5(key.encode()).hexdigest()
-    return f"{encoded}.pkl"
-
-def cache_get(name: str) -> dict | None:
-    path = CACHE_DIR / cache_file(name)
-    if path.exists():
-        with path.open("rb") as f:
-            return pickle.load(f)
-    return None
-
-def cache_set(name: str, obj) -> None:
-    path = CACHE_DIR / cache_file(name)
-    try:
-        with path.open("wb") as f:
-            pickle.dump(obj, f)
-    except pickle.PickleError as e:
-        raise CacheError(
-            f"Serialization error while saving cache for '{name}': {e}"
-        ) from e
-    except (OSError, IOError) as e:
-        raise CacheError(
-            f"File error while saving cache for '{name}': {e}"
-        ) from e
-
+COORDS_CACHE = Path("coords_cache.json")
 THEMES_DIR = "themes"
 FONTS_DIR = "fonts"
 POSTERS_DIR = "posters"
+
+def load_coords_cache():
+    if not COORDS_CACHE.exists():
+        return {}
+
+    try:
+        data = json.loads(COORDS_CACHE.read_text())
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    print("⚠ Coordinate cache is corrupted, ignoring it")
+    return {}
+
+
+def save_coords_cache(cache: dict[str, list[float]]) -> None:
+    tmp_path = COORDS_CACHE.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(cache, indent=2))
+    tmp_path.replace(COORDS_CACHE)
+
 
 def load_fonts():
     """
@@ -242,12 +231,15 @@ def get_coordinates(city, country):
     Fetches coordinates for a given city and country using geopy.
     Includes rate limiting to be respectful to the geocoding service.
     """
-    coords = f"coords_{city.lower()}_{country.lower()}"
-    cached = cache_get(coords)
-    if cached:
-        print(f"✓ Using cached coordinates for {city}, {country}")
-        return cached
+    key = f"{city.lower()}, {country.lower()}"
+    cache = load_coords_cache()
+    if key in cache:
+        cached = cache.get(key)
+        if isinstance(cached, list) and len(cached) == 2:
+            print(f"✓ Using cached coordinates for {city}, {country}")
+            return tuple(cached)
 
+    
     print("Looking up coordinates...")
     geolocator = Nominatim(user_agent="city_map_poster", timeout=10) # type: ignore
     
@@ -276,10 +268,9 @@ def get_coordinates(city, country):
         else:
             print("✓ Found location (address not available)")
         print(f"✓ Coordinates: {location.latitude}, {location.longitude}")
-        try:
-            cache_set(coords, (location.latitude, location.longitude))
-        except CacheError as e:
-            print(e)
+        cache[key] = [float(location.latitude), float(location.longitude)]
+        save_coords_cache(cache)
+
         return (location.latitude, location.longitude)
     else:
         raise ValueError(f"Could not find coordinates for {city}, {country}")
@@ -337,43 +328,28 @@ def get_crop_limits(G: MultiDiGraph, fig: Figure) -> tuple[tuple[float, float], 
     return crop_xlim, crop_ylim
 
 def fetch_graph(point, dist) -> MultiDiGraph | None:
-    lat, lon = point
-    graph = f"graph_{lat}_{lon}_{dist}"
-    cached = cache_get(graph)
-    if cached is not None:
-        print("✓ Using cached street network")
-        return cast(MultiDiGraph, cached)
-
     try:
-        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
-        # Rate limit between requests
+        G = ox.graph_from_point(
+            point,
+            dist=dist,
+            dist_type="bbox",
+            network_type="all"
+        )
         time.sleep(0.5)
-        try:
-            cache_set(graph, G)
-        except CacheError as e:
-            print(e)
         return G
     except Exception as e:
         print(f"OSMnx error while fetching graph: {e}")
         return None
 
-def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
-    lat, lon = point
-    tag_str = "_".join(tags.keys())
-    features = f"{name}_{lat}_{lon}_{dist}_{tag_str}"
-    cached = cache_get(features)
-    if cached is not None:
-        print(f"✓ Using cached {name}")
-        return cast(GeoDataFrame, cached)
 
+def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
     try:
-        data = ox.features_from_point(point, tags=tags, dist=dist)
-        # Rate limit between requests
+        data = ox.features_from_point(
+            point,
+            tags=tags,
+            dist=dist
+        )
         time.sleep(0.3)
-        try:
-            cache_set(features, data)
-        except CacheError as e:
-            print(e)
         return data
     except Exception as e:
         print(f"OSMnx error while fetching features: {e}")
